@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_NAME="${0##*/}"
+
+usage() {
+  cat <<EOF
+Usage: ${SCRIPT_NAME} [--project-root <path>] [--skip-start] [--no-seed]
+
+Start a local Supabase stack for a Lovable project and replay the project's
+SQL migrations against the local database.
+
+What it does:
+  1. Detects the Lovable git repository root, or uses --project-root
+  2. Verifies Docker, git, and the Supabase CLI are available
+  3. Ensures the repo contains supabase/config.toml and supabase/migrations
+  4. Starts the local Supabase containers unless --skip-start is used
+  5. Runs 'supabase db reset --local' to recreate the local database
+  6. Reapplies the repo migrations, and seed data unless --no-seed is used
+
+Requirements:
+  - Run inside a Lovable project git checkout, or pass --project-root
+  - Docker must be installed and the daemon must be running
+  - Supabase CLI must be installed and available on PATH
+
+Examples:
+  ${SCRIPT_NAME}
+  ${SCRIPT_NAME} --skip-start
+  ${SCRIPT_NAME} --no-seed
+  ${SCRIPT_NAME} --project-root ~/code/my-lovable-app
+
+Options:
+  --project-root <path>  Run against a specific Lovable repository path
+  --skip-start           Do not run 'supabase start' before resetting the DB
+  --no-seed              Do not execute supabase/seed.sql during db reset
+  -h, --help             Show this help text
+
+Notes:
+  - This command is intended to be safe to rerun during development
+  - 'supabase db reset --local' resets the local database each time
+EOF
+}
+
+log() {
+  printf '[%s] %s\n' "${SCRIPT_NAME}" "$*"
+}
+
+fail() {
+  printf '[%s] %s\n' "${SCRIPT_NAME}" "$*" >&2
+  exit 1
+}
+
+require_command() {
+  local cmd="$1"
+
+  if ! command -v "${cmd}" >/dev/null 2>&1; then
+    fail "Missing required command: ${cmd}"
+  fi
+}
+
+PROJECT_ROOT=""
+SKIP_START=0
+NO_SEED=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --project-root)
+      [[ $# -ge 2 ]] || fail "Missing value for --project-root"
+      PROJECT_ROOT="$2"
+      shift 2
+      ;;
+    --skip-start)
+      SKIP_START=1
+      shift
+      ;;
+    --no-seed)
+      NO_SEED=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      fail "Unknown argument: $1"
+      ;;
+  esac
+done
+
+require_command git
+require_command docker
+require_command supabase
+
+if ! docker info >/dev/null 2>&1; then
+  fail "Docker is installed but the daemon is not running"
+fi
+
+if [[ -z "${PROJECT_ROOT}" ]]; then
+  PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+fi
+
+[[ -n "${PROJECT_ROOT}" ]] || fail "Run this inside a Lovable git repository or pass --project-root"
+[[ -d "${PROJECT_ROOT}" ]] || fail "Project root does not exist: ${PROJECT_ROOT}"
+
+cd "${PROJECT_ROOT}"
+
+[[ -f "supabase/config.toml" ]] || fail "Missing supabase/config.toml in ${PROJECT_ROOT}"
+[[ -d "supabase/migrations" ]] || fail "Missing supabase/migrations in ${PROJECT_ROOT}"
+
+shopt -s nullglob
+migration_files=(supabase/migrations/*.sql)
+shopt -u nullglob
+
+[[ ${#migration_files[@]} -gt 0 ]] || fail "No SQL migration files found in supabase/migrations"
+
+log "Project root: ${PROJECT_ROOT}"
+
+if [[ "${SKIP_START}" -eq 0 ]]; then
+  log "Starting local Supabase containers"
+  supabase start
+else
+  log "Skipping container startup"
+fi
+
+reset_args=(db reset --local)
+
+if [[ "${NO_SEED}" -eq 1 ]]; then
+  reset_args+=(--no-seed)
+fi
+
+log "Resetting local database and replaying migrations"
+printf 'y\n' | supabase "${reset_args[@]}"
+
+log "Local Supabase is ready"
+supabase status
