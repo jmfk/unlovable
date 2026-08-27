@@ -1,8 +1,44 @@
-# Migration från Lovable + Supabase Cloud till Self-Hosted
+# Lokal utveckling och self-hosted Supabase
 
 ## Sammanfattning
 
-**Ja, det går att köra Supabase lokalt (self-hosted) och migrera bort från Lovable.** Supabase är open source och erbjuder en officiell Docker Compose-stack som inkluderar alla komponenter: PostgreSQL, Auth (GoTrue), Realtime, Storage, Edge Functions och Studio-dashboarden. Det är det enklaste och mest naturliga första steget innan en eventuell vidare migration till en helt annan stack.
+Det finns tva olika lokala arbetsfloden som ar enkla att blanda ihop:
+
+1. **Lokal utveckling mot Supabase CLI**: anvand `unlovable-local-supabase` mot ditt Lovable-apprepo. Det startar den lokala Supabase-stacken, kor migrationerna och skriver `.env.local` sa att appen pratar med lokal Supabase.
+2. **Self-hosted migration**: flytta bort fran Lovable/Supabase Cloud till en egen Docker Compose-installation av hela Supabase-stacken.
+
+Om du bara vill starta din app lokalt mot en lokal Supabase-instans, folj snabbstarten nedan. Resten av dokumentet handlar om self-hosted migration.
+
+---
+
+## Snabbstart: kor en lokal Lovable-app mot lokal Supabase
+
+Exempel med ett apprepo i `/Users/jmfk/code/monster-meadows`:
+
+```bash
+cd /Users/jmfk/code/unlovable
+make install
+unlovable-local-supabase --project-root /Users/jmfk/code/monster-meadows
+cd /Users/jmfk/code/monster-meadows
+npm i
+npm run dev
+```
+
+Det har kommandot gor foljande i apprepot:
+
+- startar lokal Supabase via Supabase CLI
+- kor `supabase db push --local` mot `supabase/migrations/`
+- skriver `.env.local` med `VITE_SUPABASE_URL` och lokal publishable key
+- uppdaterar `supabase/config.toml` med ett deterministiskt lokalt `project_id`
+- skapar `docs/supabase-status.md` om filen saknas
+
+I ett vanligt Lovable/Vite-projekt ar det sedan `npm run dev` som startar den lokala appen mot den lokala Supabase-miljon.
+
+---
+
+## Self-hosted migration fran Lovable + Supabase Cloud
+
+**Ja, det gar att kora Supabase lokalt (self-hosted) och migrera bort fran Lovable.** Supabase ar open source och erbjuder en officiell Docker Compose-stack som inkluderar alla komponenter: PostgreSQL, Auth (GoTrue), Realtime, Storage, Edge Functions och Studio-dashboarden. Det ar det enklaste och mest naturliga forsta steget innan en eventuell vidare migration till en helt annan stack.
 
 ---
 

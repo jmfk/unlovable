@@ -1,43 +1,72 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+CANONICAL_COMMAND_NAME="unlovable-local-supabase"
+LEGACY_COMMAND_NAME="lovable-local-supabase"
 SCRIPT_NAME="${0##*/}"
+case "${SCRIPT_NAME}" in
+  "${CANONICAL_COMMAND_NAME}"|"${LEGACY_COMMAND_NAME}") ;;
+  *)
+    SCRIPT_NAME="${CANONICAL_COMMAND_NAME}"
+    ;;
+esac
+DOC_PATH="docs/supabase-status.md"
+ENV_LOCAL_PATH=".env.local"
+CONFIG_PATH="supabase/config.toml"
+ENV_BLOCK_BEGIN="# BEGIN ${CANONICAL_COMMAND_NAME}"
+ENV_BLOCK_END="# END ${CANONICAL_COMMAND_NAME}"
+
+LOCAL_PROJECT_ID=""
+LOCAL_API_URL=""
+LOCAL_ANON_KEY=""
+LOCAL_DB_URL=""
+LOCAL_STUDIO_URL=""
+LOCAL_SERVICE_ROLE_KEY=""
+LOCAL_JWT_SECRET=""
 
 usage() {
   cat <<EOF
-Usage: ${SCRIPT_NAME} [--project-root <path>] [--skip-start] [--no-seed]
+Usage: ${SCRIPT_NAME} [--project-root <path>] [--skip-start] [--reset] [--no-seed]
 
-Start a local Supabase stack for a Lovable project and replay the project's
-SQL migrations against the local database.
+Start a local Supabase stack for a Lovable project and reconcile the local
+database with the project's SQL migrations.
 
 What it does:
   1. Detects the Lovable git repository root, or uses --project-root
   2. Verifies Docker, git, and the Supabase CLI are available
   3. Ensures the repo contains supabase/config.toml and supabase/migrations
   4. Starts the local Supabase containers unless --skip-start is used
-  5. Runs 'supabase db reset --local' to recreate the local database
-  6. Reapplies the repo migrations, and seed data unless --no-seed is used
+  5. Writes .env.local in that repo so the app uses the local Supabase stack
+  6. Applies any pending local migrations without resetting the database
+  7. Optionally resets and reseeds the local database when --reset is used
+  8. Prints the next command to start the app locally
 
 Requirements:
   - Run inside a Lovable project git checkout, or pass --project-root
   - Docker must be installed and the daemon must be running
-  - Supabase CLI must be installed and available on PATH
+  - Supabase CLI must be installed (will attempt auto-install via brew or npm if missing)
 
 Examples:
   ${SCRIPT_NAME}
   ${SCRIPT_NAME} --skip-start
-  ${SCRIPT_NAME} --no-seed
+  ${SCRIPT_NAME} --reset
+  ${SCRIPT_NAME} --reset --no-seed
   ${SCRIPT_NAME} --project-root ~/code/my-lovable-app
+  ${SCRIPT_NAME} --project-root /Users/jmfk/code/monster-meadows
 
 Options:
   --project-root <path>  Run against a specific Lovable repository path
-  --skip-start           Do not run 'supabase start' before resetting the DB
-  --no-seed              Do not execute supabase/seed.sql during db reset
+  --skip-start           Do not run 'supabase start' before reconciling the DB
+  --reset                Reset the local database before replaying migrations
+  --no-seed              Skip supabase/seed.sql during --reset
   -h, --help             Show this help text
 
 Notes:
-  - This command is intended to be safe to rerun during development
-  - 'supabase db reset --local' resets the local database each time
+  - Re-running this command preserves your existing local database state
+  - The target repo is wired to local Supabase through .env.local
+  - Pending migrations are applied with 'supabase db push --local'
+  - Use --reset for a clean rebuild of the local database
+  - After this finishes, start the app from that repo with 'npm run dev'
 EOF
 }
 
@@ -50,6 +79,101 @@ fail() {
   exit 1
 }
 
+extract_port_conflict() {
+  local output="$1"
+
+  if [[ "${output}" =~ Bind[[:space:]]for[[:space:]][^:]+:([0-9]+)[[:space:]]failed:[[:space:]]port[[:space:]]is[[:space:]]already[[:space:]]allocated ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+
+  return 1
+}
+
+container_name_for_host_port() {
+  local host_port="$1"
+
+  docker ps --format '{{.Names}} {{.Ports}}' | awk -v port="${host_port}" '
+    index($0, ":" port "->") {
+      print $1
+      exit
+    }
+  '
+}
+
+supabase_project_id_from_container_name() {
+  local container_name="$1"
+  local prefix=""
+  local prefixes=(
+    "supabase_db_"
+    "supabase_auth_"
+    "supabase_realtime_"
+    "supabase_storage_"
+    "supabase_imgproxy_"
+    "supabase_img_proxy_"
+    "supabase_edge_runtime_"
+    "supabase_edge-runtime_"
+    "supabase_analytics_"
+    "supabase_pgmeta_"
+    "supabase_pg_meta_"
+    "supabase_gateway_"
+    "supabase_kong_"
+    "supabase_api_"
+    "supabase_rest_"
+    "supabase_mailpit_"
+    "supabase_studio_"
+    "supabase_vector_"
+    "supabase_supavisor_"
+    "supabase_pooler_"
+  )
+
+  for prefix in "${prefixes[@]}"; do
+    if [[ "${container_name}" == "${prefix}"* ]]; then
+      printf '%s\n' "${container_name#"${prefix}"}"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+attempt_start_with_conflict_recovery() {
+  local start_output=""
+  local conflicting_port=""
+  local conflicting_container=""
+  local conflicting_project_id=""
+
+  if start_output="$(supabase start 2>&1)"; then
+    printf '%s\n' "${start_output}"
+    return 0
+  fi
+
+  conflicting_port="$(extract_port_conflict "${start_output}" || true)"
+  if [[ -z "${conflicting_port}" ]]; then
+    printf '%s\n' "${start_output}" >&2
+    return 1
+  fi
+
+  conflicting_container="$(container_name_for_host_port "${conflicting_port}" || true)"
+  conflicting_project_id="$(supabase_project_id_from_container_name "${conflicting_container}" || true)"
+
+  if [[ -z "${conflicting_project_id}" || "${conflicting_project_id}" == "${LOCAL_PROJECT_ID}" ]]; then
+    printf '%s\n' "${start_output}" >&2
+    fail "Port ${conflicting_port} is already in use. Stop the conflicting process or set a different local port in ${CONFIG_PATH}."
+  fi
+
+  log "Port ${conflicting_port} is in use by Supabase project ${conflicting_project_id}; stopping it and retrying"
+  supabase stop --project-id "${conflicting_project_id}"
+
+  if start_output="$(supabase start 2>&1)"; then
+    printf '%s\n' "${start_output}"
+    return 0
+  fi
+
+  printf '%s\n' "${start_output}" >&2
+  fail "Supabase failed to start after stopping conflicting project ${conflicting_project_id}"
+}
+
 require_command() {
   local cmd="$1"
 
@@ -58,8 +182,243 @@ require_command() {
   fi
 }
 
+ensure_supabase() {
+  if command -v supabase >/dev/null 2>&1; then
+    return 0
+  fi
+
+  log "Supabase CLI not found. Attempting to install..."
+
+  if command -v brew >/dev/null 2>&1; then
+    log "Found Homebrew. Installing supabase/tap/supabase..."
+    brew install supabase/tap/supabase
+  elif command -v npm >/dev/null 2>&1; then
+    log "Found npm. Installing supabase globally..."
+    npm install -g supabase
+  else
+    fail "Supabase CLI is not installed and no supported installer (brew or npm) was found on PATH."
+  fi
+
+  # Re-check after install
+  if ! command -v supabase >/dev/null 2>&1; then
+    fail "Installation appeared to succeed but 'supabase' command is still not found on PATH. You may need to restart your shell."
+  fi
+
+  log "Supabase CLI installed successfully."
+}
+
+desired_local_project_id() {
+  local base
+
+  base="$(basename "${PROJECT_ROOT}")"
+  base="$(printf '%s' "${base}" | tr '[:upper:]-' '[:lower:]_' | tr -cd 'a-z0-9_')"
+  base="${base}_local"
+  base="${base:0:40}"
+
+  if [[ -z "${base}" ]]; then
+    base="local_supabase"
+  fi
+
+  printf '%s\n' "${base}"
+}
+
+update_local_project_config() {
+  local desired_project_id="$1"
+  local temp_file
+
+  temp_file="$(mktemp)"
+
+  awk -v project_id="${desired_project_id}" '
+    BEGIN { updated = 0 }
+    /^[[:space:]]*project_id[[:space:]]*=/ && updated == 0 {
+      print "project_id = \"" project_id "\""
+      updated = 1
+      next
+    }
+    { print }
+    END {
+      if (updated == 0) {
+        print ""
+        print "project_id = \"" project_id "\""
+      }
+    }
+  ' "${CONFIG_PATH}" > "${temp_file}"
+
+  mv "${temp_file}" "${CONFIG_PATH}"
+  log "Set ${CONFIG_PATH} project_id to ${desired_project_id}"
+}
+
+ensure_stack_running() {
+  if supabase status >/dev/null 2>&1; then
+    log "Supabase is already running."
+    return 0
+  fi
+
+  log "Starting local Supabase containers"
+  attempt_start_with_conflict_recovery
+
+  if ! supabase status >/dev/null 2>&1; then
+    fail "Supabase stack did not become ready after startup"
+  fi
+}
+
+reconcile_local_database() {
+  log "Applying pending local migrations without resetting the database"
+  supabase db push --local
+}
+
+reset_local_database() {
+  local reset_args=(db reset --local)
+
+  if [[ "${NO_SEED}" -eq 1 ]]; then
+    reset_args+=(--no-seed)
+  fi
+
+  log "Resetting local database and replaying migrations"
+  printf 'y\n' | supabase "${reset_args[@]}"
+}
+
+load_local_status_values() {
+  local status_env="$1"
+  local line=""
+  local key=""
+  local value=""
+
+  LOCAL_API_URL=""
+  LOCAL_ANON_KEY=""
+  LOCAL_DB_URL=""
+  LOCAL_STUDIO_URL=""
+  LOCAL_SERVICE_ROLE_KEY=""
+  LOCAL_JWT_SECRET=""
+
+  while IFS= read -r line; do
+    line="${line#export }"
+    [[ "${line}" == *=* ]] || continue
+
+    key="${line%%=*}"
+    value="${line#*=}"
+    value="${value#\"}"
+    value="${value%\"}"
+    value="${value#\'}"
+    value="${value%\'}"
+
+    case "${key}" in
+      API_URL) LOCAL_API_URL="${value}" ;;
+      ANON_KEY) LOCAL_ANON_KEY="${value}" ;;
+      DB_URL) LOCAL_DB_URL="${value}" ;;
+      STUDIO_URL) LOCAL_STUDIO_URL="${value}" ;;
+      SERVICE_ROLE_KEY) LOCAL_SERVICE_ROLE_KEY="${value}" ;;
+      JWT_SECRET) LOCAL_JWT_SECRET="${value}" ;;
+    esac
+  done <<< "${status_env}"
+
+  [[ -n "${LOCAL_API_URL}" ]] || fail "Could not determine the local Supabase API URL from 'supabase status -o env'"
+  [[ -n "${LOCAL_ANON_KEY}" ]] || fail "Could not determine the local Supabase anon key from 'supabase status -o env'"
+}
+
+write_local_env() {
+  local temp_file=""
+  local temp_block=""
+
+  temp_block="$(mktemp)"
+  temp_file="$(mktemp)"
+
+  cat > "${temp_block}" <<EOF
+${ENV_BLOCK_BEGIN}
+VITE_SUPABASE_URL="${LOCAL_API_URL}"
+VITE_SUPABASE_PUBLISHABLE_KEY="${LOCAL_ANON_KEY}"
+VITE_SUPABASE_ANON_KEY="${LOCAL_ANON_KEY}"
+VITE_SUPABASE_PROJECT_ID="${LOCAL_PROJECT_ID}"
+${ENV_BLOCK_END}
+EOF
+
+  if [[ -f "${ENV_LOCAL_PATH}" ]]; then
+    awk -v begin="${ENV_BLOCK_BEGIN}" -v end="${ENV_BLOCK_END}" -v block_file="${temp_block}" '
+      BEGIN { in_block = 0; replaced = 0 }
+      $0 == begin {
+        while ((getline line < block_file) > 0) {
+          print line
+        }
+        close(block_file)
+        if (replaced == 0) {
+          replaced = 1
+        }
+        in_block = 1
+        next
+      }
+      $0 == end {
+        in_block = 0
+        next
+      }
+      in_block == 0 { print }
+      END {
+        if (replaced == 0) {
+          if (NR > 0) {
+            print ""
+          }
+          while ((getline line < block_file) > 0) {
+            print line
+          }
+          close(block_file)
+        }
+      }
+    ' "${ENV_LOCAL_PATH}" > "${temp_file}"
+  else
+    cp "${temp_block}" "${temp_file}"
+  fi
+
+  mv "${temp_file}" "${ENV_LOCAL_PATH}"
+  rm -f "${temp_block}"
+  log "Wrote ${ENV_LOCAL_PATH}"
+}
+
+write_status_documentation_if_missing() {
+  local status_output="$1"
+  local cli_version=""
+
+  if [[ -f "${DOC_PATH}" ]]; then
+    return 0
+  fi
+
+  mkdir -p "$(dirname "${DOC_PATH}")"
+  cli_version="$(supabase --version 2>/dev/null || true)"
+
+  cat > "${DOC_PATH}" <<EOF
+# Local Supabase Setup Status
+
+## Summary
+The local Supabase development environment has been initialized for this project.
+
+## CLI Version
+\`\`\`text
+${cli_version}
+\`\`\`
+
+## Runtime Status
+\`\`\`text
+${status_output}
+\`\`\`
+
+---
+*Generated by ${SCRIPT_NAME}*
+EOF
+
+  log "Created ${DOC_PATH}"
+}
+
+print_next_steps() {
+  printf '\n'
+  printf 'Next steps:\n'
+  printf '  1. cd "%s"\n' "${PROJECT_ROOT}"
+  printf '  2. npm install\n'
+  printf '  3. npm run dev\n'
+  printf '\n'
+  printf 'The managed local Supabase values were written to %s/%s\n' "${PROJECT_ROOT}" "${ENV_LOCAL_PATH}"
+}
+
 PROJECT_ROOT=""
 SKIP_START=0
+RESET=0
 NO_SEED=0
 
 while [[ $# -gt 0 ]]; do
@@ -71,6 +430,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-start)
       SKIP_START=1
+      shift
+      ;;
+    --reset)
+      RESET=1
       shift
       ;;
     --no-seed)
@@ -89,7 +452,7 @@ done
 
 require_command git
 require_command docker
-require_command supabase
+ensure_supabase
 
 if ! docker info >/dev/null 2>&1; then
   fail "Docker is installed but the daemon is not running"
@@ -104,7 +467,7 @@ fi
 
 cd "${PROJECT_ROOT}"
 
-[[ -f "supabase/config.toml" ]] || fail "Missing supabase/config.toml in ${PROJECT_ROOT}"
+[[ -f "${CONFIG_PATH}" ]] || fail "Missing ${CONFIG_PATH} in ${PROJECT_ROOT}"
 [[ -d "supabase/migrations" ]] || fail "Missing supabase/migrations in ${PROJECT_ROOT}"
 
 shopt -s nullglob
@@ -114,22 +477,32 @@ shopt -u nullglob
 [[ ${#migration_files[@]} -gt 0 ]] || fail "No SQL migration files found in supabase/migrations"
 
 log "Project root: ${PROJECT_ROOT}"
+LOCAL_PROJECT_ID="$(desired_local_project_id)"
+update_local_project_config "${LOCAL_PROJECT_ID}"
 
 if [[ "${SKIP_START}" -eq 0 ]]; then
-  log "Starting local Supabase containers"
-  supabase start
+  ensure_stack_running
 else
   log "Skipping container startup"
 fi
 
-reset_args=(db reset --local)
-
-if [[ "${NO_SEED}" -eq 1 ]]; then
-  reset_args+=(--no-seed)
+if [[ "${NO_SEED}" -eq 1 && "${RESET}" -eq 0 ]]; then
+  log "--no-seed only applies together with --reset; continuing without a reset"
 fi
 
-log "Resetting local database and replaying migrations"
-printf 'y\n' | supabase "${reset_args[@]}"
+if [[ "${RESET}" -eq 1 ]]; then
+  reset_local_database
+else
+  reconcile_local_database
+fi
+
+status_env="$(supabase status -o env)"
+load_local_status_values "${status_env}"
+write_local_env
+
+status_output="$(supabase status)"
+write_status_documentation_if_missing "${status_output}"
 
 log "Local Supabase is ready"
-supabase status
+print_next_steps
+printf '%s\n' "${status_output}"
